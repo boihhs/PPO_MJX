@@ -36,8 +36,8 @@ class Sim:
         mj_model       = mujoco.MjModel.from_xml_path(cfg.xml_path)
         mj_model.opt.iterations = 10
 
-        paddle_id = mujoco.mj_name2id(mj_model, mujoco.mjtObj.mjOBJ_GEOM, "ball_geom")
-        ball_id   = mujoco.mj_name2id(mj_model, mujoco.mjtObj.mjOBJ_GEOM, "paddle_face")
+        paddle_id = mujoco.mj_name2id(mj_model, mujoco.mjtObj.mjOBJ_GEOM, "paddle_face")
+        ball_id   = mujoco.mj_name2id(mj_model, mujoco.mjtObj.mjOBJ_GEOM, "ball_geom")
         table_id   = mujoco.mj_name2id(mj_model, mujoco.mjtObj.mjOBJ_GEOM, "table_top")
         net_id   = mujoco.mj_name2id(mj_model, mujoco.mjtObj.mjOBJ_GEOM, "net_geom")
 
@@ -51,6 +51,8 @@ class Sim:
         def _step(qpos, qvel, ctrl):
             d = self.blank.replace(qpos=qpos, qvel=qvel, ctrl=ctrl)
             d = mjx.step(self.mjx_model, d)
+            sanitize = lambda x: jnp.nan_to_num(x, nan=0.0, posinf=1e6, neginf=-1e6)
+            d = jax.tree_util.tree_map(sanitize, d)
 
             def _get_contacts(mjx_data):
                 ncon = mjx_data.ncon                          
