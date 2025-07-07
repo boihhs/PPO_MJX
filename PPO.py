@@ -7,152 +7,169 @@ from Sim import Sim, SimCfg, SimData
 import optax
 from flax.training import checkpoints
 from pathlib import Path
+from normlize import meanvar_init, meanvar_normalize, meanvar_update, MeanVarState
 
 # qpos is [ballxyz, ballquat, paddelxyz]
 class PPO:
-    def __init__(self, policy_model, value_model, Sim, key=random.PRNGKey(0)):
+    def __init__(
+        self,
+        policy_model,
+        value_model,
+        Sim,
+        key=random.PRNGKey(0),
+        num_envs: int       = 512,
+        unroll_length: int  = 32,
+        minibatch_size: int = 256,
+        ppo_epochs: int     = 4,
+        lr: float           = 3e-4,
+        gamma: float        = 0.97,
+        lam: float          = 0.95,
+    ):
         self.policy_model = policy_model
         self.value_model = value_model
         self.Sim = Sim
         self.key = key
-        self.gamma = .9
-        self.llambda = .9
+        self.gamma = gamma
+        self.llambda = lam
 
-        # In your PPO __init__
-        initial_lr = 3e-5
+        self.unroll_length = unroll_length
+        self.epochs = 100
+        self.minibatch_size = minibatch_size
+        self.ppo_epochs = ppo_epochs
 
-        self.steps = 3000
-
-        self.epochs=100
-        self.minibatch_size=256
-        self.ppo_epochs=4
-
-        
+        opt_lr = lr
         self.policy_opt = optax.chain(
             optax.clip_by_global_norm(0.5),
-            optax.adam(learning_rate=3e-4)
+            optax.adam(learning_rate=opt_lr)
         )
         self.value_opt = optax.chain(
             optax.clip_by_global_norm(0.5),
-            optax.adam(learning_rate=1e-4)
+            optax.adam(learning_rate=opt_lr)
         )
         self.policy_opt_state = self.policy_opt.init(self.policy_model)
         self.value_opt_state = self.value_opt.init(self.value_model)
+
         
     @staticmethod
     @jax.jit
-    def reward(prevState: SimData, nextState: SimData, ctrls: jnp.ndarray, contacts: jnp.ndarray, prev_ctrls: jnp.ndarray):
+    def reward(prevState: SimData, nextState: SimData, ctrls: jnp.ndarray, prev_ctrls: jnp.ndarray):
         qpos = nextState.qpos
         qvel = nextState.qvel
+
 
         prev_qpos = prevState.qpos
         prev_qvel = prevState.qvel
 
-        @partial(jax.vmap, in_axes=(0,0,0,0,0,0, 0), out_axes=(0,0))
-        def _reward_and_done(qpos: jnp.ndarray, qvel: jnp.ndarray, prev_qpos: jnp.ndarray, prev_qvel: jnp.ndarray, ctrl: jnp.ndarray, contact: jnp.ndarray, prev_ctrl: jnp.ndarray):
+        step = nextState.step
 
-            PADDLE_CENTER = jnp.array([-1.5, 0.0, 1.0])
-            SPHERE_RADIUS = 2.0
-            k_sphere      = 0.05
+        _SCALE = dict(
+            dist        =  3.0,      # shaping: closer paddle‑ball distance
+            approach    =  2.0,      # reward getting closer each frame
+            hit_bonus   = 10.0,      # extra for contact, scaled by paddle vx
+            target      = 15.0,      # ball crosses net near centre‑line
+            dir         = 10.0,      # ball velocity mostly +x
+            ctrl_cost   = -0.02,     # regularise energy
+            miss        = -25.0,     # ball dropped / paddle too low
+            end         = 50.0,      # ball leaves table heading forward
+        )
 
-            paddle_ball_contact  = contact[0]
-            table_ball_contact   = contact[1]
-            ball_net_contact     = contact[2]
-            paddle_table_contact = contact[3]
+        @partial(jax.vmap, in_axes=(0, 0, 0, 0, 0, 0, 0), out_axes=(0, 0))
+        def _reward_and_done(qpos      : jnp.ndarray,
+                            qvel      : jnp.ndarray,
+                            prev_qpos : jnp.ndarray,
+                            prev_qvel : jnp.ndarray,
+                            ctrl      : jnp.ndarray,
+                            prev_ctrl : jnp.ndarray,
+                            step : jnp.ndarray):
+            # ---- constants -----------------------------------------------------------
+            TABLE_X_LIMIT  = -1.4           # ball past player → miss
+            FLOOR_Z_LIMIT  =  0.7           # ball hits floor  → miss
+            PADDLE_Z_LIMIT =  0.9           # paddle dropped   → miss
+            CONTACT_THRESH =  0.06          # paddle‑ball distance considered a hit
 
+            # ---- unpack state --------------------------------------------------------
             ball_pos        = qpos[:3]
-            ball_vel = qvel[:3]
+            ball_vel        = qvel[:3]
             prev_ball_pos   = prev_qpos[:3]
-            paddle_pos      = qpos[7:10]
-            prev_paddle_pos = prev_qpos[7:10]
-            paddle_vel      = qvel[6:9]
-            prev_paddle_vel = prev_qvel[6:9]
 
-            d      = jnp.linalg.norm(paddle_pos - ball_pos)          # current dist
+            paddle_pos      = qpos[7:10]
+            paddle_vel      = qvel[7:10]
+            prev_paddle_pos = prev_qpos[7:10]
+
+            # ---- shaping terms -------------------------------------------------------
+            d      = jnp.linalg.norm(paddle_pos - ball_pos)          # current distance
             prev_d = jnp.linalg.norm(prev_paddle_pos - prev_ball_pos)
 
-            reward_dist  = jnp.exp(-3.0 * d)                         # in (0,1]
-            reward_prog  = (d < prev_d).astype(jnp.float32)          # 1 if closer
-            # (we’ll zero this out if episode just ended, see below)
 
-            # ----------------- directional reward -----------------
-            # Want ball moving fast along +x and *not* along y or z
-            target_dir = jnp.array([1.0, 0.0, 0.0])
-            speed      = jnp.linalg.norm(ball_vel) + 1e-6
-            forward_cos = jnp.dot(ball_vel, target_dir) / speed      # ∈[-1,1]
+            # ---- ballistic target term ----------------------------------------------
+            # Predict lateral offset 0.1 s ahead and encourage centre hits (y≈0)
+            t_pred     = 0.1
+            future_y   = ball_pos[1] + ball_vel[1] * t_pred
+            target_err = jnp.abs(future_y)
+            hit_target = 1.0 - jnp.tanh(2.5 * target_err)            # ∈ (0,1]
 
-            # reward >0 only if ball is moving forward
-            dir_reward = jnp.maximum(0.0, forward_cos) * speed       # 0 if back/side
-            dir_reward = jnp.clip(dir_reward, 0.0, 20.0) * 10
+            # ---- down‑table velocity term -------------------------------------------
+            target_dir  = jnp.array([1.0, 0.0, 0.0])
+            speed       = jnp.linalg.norm(ball_vel) + 1e-6
+            forward_cos = jnp.dot(ball_vel, target_dir) / speed
+            dir_reward  = jnp.maximum(0.0, forward_cos) * (speed * 0.5)
 
-            # penalise off‑axis motion (y, z components)
-          
+            # ---- contact / termination ----------------------------------------------
+            reward_dist = jnp.exp(-2.0 * d)           # softer fall‑off
+            reward_approach = (prev_d - d) * 30.0     # raw cm change *big* weight
 
+            hit_bonus = (d < 0.08).astype(jnp.float32) * 10.0 * jnp.maximum(0, paddle_vel[0])
 
-            # ----------------- contact & termination --------------
-            hit   = d < 0.06                                        # contact event
-            hit_bonus = 10.0 * hit * jnp.maximum(0.0, paddle_vel[0]) # harder = better
-
-            
-
-            miss = (ball_pos[0] < -1.4) | (ball_pos[2] < 0.7) | (paddle_pos[2] < 0.9)
-            end  = ball_vel[0] > .5                                # ball clearly gone
-
-            invalid_state = jnp.isnan(ball_pos).any() | jnp.isinf(ball_pos).any()
-            miss = miss | invalid_state
+            miss = (
+                (ball_pos[0] < TABLE_X_LIMIT) |
+                (ball_pos[2] < FLOOR_Z_LIMIT) |
+                (paddle_pos[2] < PADDLE_Z_LIMIT)
+            )
+            end  = ball_vel[0] > 0.5                                 # ball gone forward
             done = miss | end
 
-            # ----------------- costs ------------------------------
-            ctrl_cost = -1e-2 * jnp.sum(ctrl ** 2)
+            timeout = step >= 612
+            done = done | timeout
 
-            # ----------------- episode‑boundary fix ---------------
-            # no progress reward immediately *after* a reset
-            reward_prog = jnp.where(done, 0.0, reward_prog)
+            # ---- costs ---------------------------------------------------------------
+            ctrl_cost = -jnp.sum(ctrl ** 2)
 
-            # ----------------- final reward -----------------------
+            # ---- final reward --------------------------------------------------------
             reward = (
-                3.0 * reward_dist                 # smaller shaping weight
-                + reward_prog * 3.0
-                + hit_bonus
-                + dir_reward      # much stronger signal early on
-                + ctrl_cost
-                + miss * -25.0
-                + end  * 50.0
-                )
-            
+                _SCALE["dist"]     * reward_dist +
+                _SCALE["approach"] * reward_approach +
+                _SCALE["hit_bonus"]* hit_bonus +
+                _SCALE["target"]   * hit_target +
+                _SCALE["dir"]      * dir_reward +
+                _SCALE["ctrl_cost"]* ctrl_cost +
+                _SCALE["miss"]     * miss.astype(jnp.float32) +
+                _SCALE["end"]      * end.astype(jnp.float32)
+            )
+
+            # ---- numerical‑safety guard ---------------------------------------------
+            invalid_state = jnp.isnan(ball_pos).any() | jnp.isinf(ball_pos).any()
+            reward = jnp.where(invalid_state, -25.0, reward)
 
             return reward, done
 
 
 
         # Call the vmapped function on the batch of states
-        return _reward_and_done(qpos, qvel, prev_qpos, prev_qvel, ctrls, contacts, prev_ctrls)
+        return _reward_and_done(qpos, qvel, prev_qpos, prev_qvel, ctrls, prev_ctrls, step)
 
     @partial(jax.jit, static_argnums=(0,))
-    def rollout(self, policy_Model, value_Model, key):
+    def rollout(self, policy_Model, value_Model, key, state, obs_state):
 
-        state = self.Sim.reset() # (B, SimData)
-
-        noise_qpos = jnp.zeros(state.qpos.shape)
-        noise_qvel = jnp.zeros(state.qvel.shape)
-
-        key, subkey = random.split(key)
-
-        noise = random.normal(subkey, (self.Sim.cfg.batch, 3)) * .1
-
-        key, subkey = random.split(key)
-
-        noise_vel = random.normal(subkey, (self.Sim.cfg.batch, 3))
-
-        noise_qpos = noise_qpos.at[:, 7:].set(noise)
-        noise_qvel = noise_qvel.at[:, :3].set(noise_vel)
-
-        state = SimData(noise_qpos + state.qpos, noise_qvel + state.qvel) # (B, SimData)
+        
 
         def _rollout(carry, _):
-            state, key, prev_ctrl = carry
+            state, key, prev_ctrl, obs_state = carry
 
-            s = self.Sim.getObs(state)   # (B, 19)       
+            s = self.Sim.getObs(state)   # (B, 19)   
+
+            obs_state = meanvar_update(obs_state, s)
+            s = meanvar_normalize(obs_state, s)
+
             
             x_in = s
             key, subkey = random.split(key)
@@ -162,8 +179,8 @@ class PPO:
 
             V_theta_ts = value_Model(x_in).squeeze(-1)                               
 
-            next_state, contacts = self.Sim.step(state, ctrl)     # (B, SimData), (B, 3)
-            r, done = self.reward(state, next_state, ctrl, contacts, prev_ctrl)  # (B,), (B,)
+            next_state  = self.Sim.step(state, ctrl)     # (B, SimData), (B, 3)
+            r, done = self.reward(state, next_state, ctrl, prev_ctrl)  # (B,), (B,)
 
 
             next_state = self.Sim.reset_partial(next_state, done)
@@ -174,13 +191,15 @@ class PPO:
             key, subkey = random.split(key)
             noise_qvel = random.normal(subkey, (self.Sim.cfg.batch, 3))
             noise_qvel = jnp.zeros_like(next_state.qvel).at[:, :3].set(noise_qvel) * done[:, None]
-            next_state = SimData(noise_qpos + next_state.qpos, noise_qvel + next_state.qvel)
+            next_state = SimData(noise_qpos + next_state.qpos, noise_qvel + next_state.qvel, next_state.step)
 
-            return (next_state, key, ctrl), (log_p, s, r, V_theta_ts, ctrl, done)
+            prev_ctrl_next = jnp.where(done[:, None], jnp.zeros_like(ctrl), ctrl)
+
+            return (next_state, key, prev_ctrl_next, obs_state), (log_p, s, r, V_theta_ts, ctrl, done)
         
         prev_ctrl = jnp.zeros((state.qpos.shape[0], 3))
         
-        (state, key, _), (log_probs_old, states, rewards, V_theta_ts, ctrls, dones) = jax.lax.scan(_rollout, (state, key, prev_ctrl), None, length=self.steps)
+        (state, key, _, obs_state), (log_probs_old, states, rewards, V_theta_ts, ctrls, dones) = jax.lax.scan(_rollout, (state, key, prev_ctrl, obs_state), None, length=self.unroll_length)
         # log_probs_old (T, B)
         # states (T, B, 19)
         # rewards (T, B)
@@ -202,12 +221,12 @@ class PPO:
             return (V_theta_t, A_t), (V_s_t, A_t)
         
         A_t_plus_1 = jnp.zeros(V_theta_ts.shape[-1])
-        V_theta_t_plus_1 = value_Model(self.Sim.getObs(state)).squeeze(-1)
+        V_theta_t_plus_1 = V_theta_ts[-1]
 
-        (_, _), (V_s_ts, A_ts) = jax.lax.scan(_compute_A_t_and_V_s_t, (V_theta_t_plus_1, A_t_plus_1), (V_theta_ts, rewards, dones), length=self.steps, reverse=True)
+        (_, _), (V_s_ts, A_ts) = jax.lax.scan(_compute_A_t_and_V_s_t, (V_theta_t_plus_1, A_t_plus_1), (V_theta_ts, rewards, dones), length=self.unroll_length, reverse=True)
         # A_ts and V_ts are both (T, B)
 
-        T, B = self.steps, self.Sim.cfg.batch
+        T, B = self.unroll_length, self.Sim.cfg.batch
         
         flat_logp     = jax.lax.stop_gradient(log_probs_old.reshape((T * B,)))
         flat_states   = jax.lax.stop_gradient(states.reshape((T * B, -1)))
@@ -236,7 +255,7 @@ class PPO:
             "old_ctrls": flat_ctrls
         }
 
-        return Batch, key
+        return Batch, key, state, obs_state
     
     @staticmethod
     @jax.jit
@@ -253,20 +272,22 @@ class PPO:
 
 
         log_ratio = new_log_p - old_log_p
-        ratio     = jnp.exp(log_ratio)
+        ratio     = jnp.exp(jnp.clip(log_ratio, -10.0, 10.0))   # pre‑exp clip
+        eps       = 0.2
 
-        eps       = 0.3
         ratio_clipped = jnp.clip(ratio, 1 - eps, 1 + eps)
         L_P       = -jnp.mean(jnp.minimum(ratio * A_ts, ratio_clipped * A_ts))
 
         L_P = jnp.nan_to_num(L_P, nan=0.0, posinf=1e3, neginf=-1e3)
 
-        L_E = jnp.mean(jnp.sum( 0.5*(jnp.log(2*jnp.pi*stds**2 + 1e-6) + 1), axis=-1))
+        log_stds = jnp.log(stds + 1e-6)
+        L_E = jnp.mean(jnp.sum(0.5 * (1 + jnp.log(2*jnp.pi) + 2*log_stds), axis=-1))
 
         kl   = jnp.mean(old_log_p - new_log_p)
 
         kl = jnp.mean(jnp.clip(old_log_p - new_log_p, -500.0, 500.0))
 
+        L_E = jnp.clip(L_E, -10.0, 10.0)
         loss = L_P - 0.01 * L_E + 0.01 * kl
         loss = jnp.nan_to_num(loss, nan=0.0, posinf=1e3, neginf=-1e3)
         return loss
@@ -298,13 +319,15 @@ class PPO:
         policy_loss_grad_fn = jax.jit(jax.value_and_grad(self.loss_fn_policy))
         value_loss_grad_fn = jax.jit(jax.value_and_grad(self.loss_fn_value))
 
+        state = self.Sim.reset() # (B, SimData)
+        obs_state  = meanvar_init((self.policy_model.size_in,))
+
         for epoch in range(self.epochs):
 
-            batch, self.key = self.rollout(self.policy_model, self.value_model, self.key)
+            batch, self.key, state, obs_state = self.rollout(self.policy_model, self.value_model, self.key, state, obs_state)
 
             # Print metrics from the collected data
             mean_reward = batch['rewards'].mean().item()
-            print(batch["logp_old"].shape[0])
             print(f"Epoch {epoch:3d} | mean reward/step : {mean_reward:8.4f}")
             mean_v_targe = batch['V_targets'].mean().item()
             print(f"Epoch {epoch:3d} | mean v_targe/step : {mean_v_targe:8.4f}")
@@ -313,6 +336,10 @@ class PPO:
             nan_reward = jnp.isnan(batch['rewards']).any()
             nan_value  = jnp.isnan(batch['V_targets']).any()
             print(f"[epoch {epoch}] nan_state={nan_state}  nan_reward={nan_reward}  nan_value={nan_value}")
+
+            v_pred_1  = jnp.percentile(batch['V_targets'], 1).item()
+            v_pred_99 = jnp.percentile(batch['V_targets'], 99).item()
+            print(f"Epoch {epoch:3d} | V_target 1‑99%  : {v_pred_1:6.1f} … {v_pred_99:6.1f}")
 
 
             def _run_epoch(carry, xs):
@@ -330,6 +357,7 @@ class PPO:
 
                     key, subkey = random.split(key)
                     subkeys = random.split(subkey, self.minibatch_size)
+                    
 
                     policy_loss, policy_grads = policy_loss_grad_fn(policy_model, mini_batch["advantages"], mini_batch["logp_old"], mini_batch["states"], mini_batch["old_ctrls"], subkeys)
                     
@@ -343,7 +371,7 @@ class PPO:
                     
                     return (policy_model, value_model, policy_opt_state, value_opt_state, batch, key), (value_loss + policy_loss)
                 
-                mini_epoch_starting = jnp.arange(0, N - self.minibatch_size, self.minibatch_size)
+                mini_epoch_starting = jnp.arange(0, N, self.minibatch_size)
 
                 (policy_model, value_model, policy_opt_state, value_opt_state, _, key), losses = jax.lax.scan(_run_mini_batch_epoch, (policy_model, value_model, policy_opt_state, value_opt_state, batch, key), mini_epoch_starting, length=mini_epoch_starting.shape[0])
 
@@ -364,4 +392,4 @@ class PPO:
                 prefix="policy_",
                 overwrite=True
             )
-            print(f"          | ✓ saved weights to {ckpt_dir}/policy_{epoch}")
+            # print(f"          | ✓ saved weights to {ckpt_dir}/policy_{epoch}")

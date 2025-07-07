@@ -42,12 +42,12 @@ class Policy:
         mus = raw[:self.size_out//2]
         log_stds = raw[self.size_out//2:]
 
-        LOG_STD_MIN = -1.0
-        LOG_STD_MAX = 3
         CTRL_BOUND = 10
-        log_stds = jnp.clip(log_stds, LOG_STD_MIN, LOG_STD_MAX)
+        min_std = 1e-3
+        log_stds = jax.nn.softplus(log_stds) + min_std   
+        log_stds = jnp.clip(log_stds, -8.0, 2.0)
+        stds     = jnp.exp(log_stds)                                   
 
-        stds = jnp.exp(log_stds)
 
         key, subkey = random.split(key)
         noise = random.normal(subkey, stds.shape)
@@ -84,12 +84,12 @@ class Policy:
         mus = raw[:self.size_out//2]
         log_stds = raw[self.size_out//2:]
 
-        LOG_STD_MIN = -1
-        LOG_STD_MAX = 3
         CTRL_BOUND = 10
-        log_stds = jnp.clip(log_stds, LOG_STD_MIN, LOG_STD_MAX)
+        min_std = 1e-3
+        log_stds = jax.nn.softplus(log_stds) + min_std   
+        log_stds = jnp.clip(log_stds, -8.0, 2.0)
+        stds     = jnp.exp(log_stds)                               
 
-        stds = jnp.exp(log_stds)
         ctrls = CTRL_BOUND * jnp.tanh(mus)
 
         return ctrls, stds
